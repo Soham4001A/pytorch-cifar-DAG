@@ -1,5 +1,7 @@
 # Ignore model checkpoints and weights
 checkpoint/
+models/
+data/
 *.pth
 *.pt
 *.ckpt
