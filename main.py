@@ -8,7 +8,7 @@ from collections import defaultdict
 import torch, torch.nn as nn, torch.optim as optim
 import torch.backends.cudnn as cudnn
 import torchvision, torchvision.transforms as transforms
-import pandas as pd, matplotlib.pyplot as plt
+import pandas as pd, matplotlib.pyplot as plt # type: ignore
 
 # repo-local imports
 from models import *
