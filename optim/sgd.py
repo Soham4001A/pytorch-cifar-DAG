@@ -84,46 +84,14 @@ def _try_multi_tensor_std(grads: List[Tensor]) -> Optional[List[Tensor]]:
     except Exception:
         return None
 
-
-# optim/dag.py
-import math
-from typing import Iterable, List, Optional, Tuple
-
-import torch
-from torch import Tensor
-from torch.optim.optimizer import Optimizer
-
-
-# ----------------------------------------------------------------------#
-# (optional) exact multi-tensor σ from Apex
-# ----------------------------------------------------------------------#
-def _try_multi_tensor_std(grads: List[Tensor]) -> Optional[List[Tensor]]:
-    try:
-        from apex.multi_tensor_apply import multi_tensor_std  # type: ignore
-        sigmas, _ = multi_tensor_std([[g for g in grads]], unbiased=False)
-        return sigmas
-    except Exception:
-        return None
-
 __all__ = ["DAG"]
 
-# ----------------------------------------------------------------------
-def _try_multi_tensor_std(tensors: List[torch.Tensor]):
-    """
-    Returns a list[0-d tensor] with per-tensor std if Apex is available.
-    Otherwise, returns None.
-    """
-    try:
-        from apex.multi_tensor_apply import multi_tensor_std  # type: ignore
-        return multi_tensor_std(tensors, unbiased=False)
-    except Exception:
-        return None
-# ----------------------------------------------------------------------
-
-
 class DAG(Optimizer):
-    r"""Dynamic-Alpha Gradient (DAG) — AlphaGrad + adaptive α + RMS shrink."""
+    r"""Dynamic-Alpha Gradient (DAG) — AlphaGrad + adaptive α + RMS-shrink."""
 
+    # -------------------------------------------------------------- #
+    # Constructor
+    # -------------------------------------------------------------- #
     def __init__(
         self,
         params: Iterable,
@@ -132,6 +100,7 @@ class DAG(Optimizer):
         dampening: float = 0.0,
         weight_decay: float = 0.0,
         k_val: float = 1.0,
+        k_sched: Optional[Callable[[int], float]] = None,     # ← NEW
         nesterov: bool = False,
         *,
         maximize: bool = False,
@@ -145,33 +114,36 @@ class DAG(Optimizer):
         # statistics switches
         use_exact_sigma: bool = False,
         sigma_every: int = 1,
-        sat_every: int = 10,           # ← new (see notes above)
+        sat_every: int = 10,
     ):
-        # ─── α-controller defaults ─────────────────────────────────────
+        # ─── α-controller defaults ────────────────────────────────
         h = dict(
-            tau=1.25, p_star=0.10, kappa=None,
-            beta=1 / 3, eta=0.5, rho=0.05,
+            tau=2.5, p_star=0.10, kappa=None,
+            beta=1/3, eta=0.5, rho=0.05,
             eps=1e-8, alpha_min=1e-12, alpha_max=1e12,
         )
-        if hyper:
-            h.update(hyper)
+        if hyper: h.update(hyper)
         if h["kappa"] is None:
             inv = torch.distributions.Normal(0, 1).icdf(
                 torch.tensor(1 - h["p_star"] / 2))
             h["kappa"] = h["tau"] / inv.item()
         self.h = h
 
-        # ─── RMS-shrink defaults ──────────────────────────────────────
+        # ─── RMS-shrink defaults ─────────────────────────────────
         s = dict(lambda_rms=0.3, s_min=0.1, gamma=1.0,
                  ema_beta=0.98, warmup_steps=500)
-        if shrink:
-            s.update(shrink)
+        if shrink: s.update(shrink)
         self.s_cfg = s
 
-        self.k_val          = float(k_val)
+        # ─── k-value bookkeeping ─────────────────────────────────
+        self.k_val0  = float(k_val)               # original base value
+        self.k_val   = float(k_val)               # current value
+        self.k_sched = k_sched                    # callable or None   
+
+        # ─── misc switches ───────────────────────────────────────
         self.use_exact_sigma = bool(use_exact_sigma)
-        self.sigma_every     = int(max(1, sigma_every))
-        self.sat_every       = int(max(1, sat_every))
+        self.sigma_every     = max(1, int(sigma_every))
+        self.sat_every       = max(1, int(sat_every))
 
         defaults = dict(lr=lr, momentum=momentum, dampening=dampening,
                         weight_decay=weight_decay, nesterov=nesterov,
@@ -179,9 +151,11 @@ class DAG(Optimizer):
                         differentiable=differentiable, fused=fused)
         super().__init__(params, defaults)
 
-        self.d_total = sum(p.numel()
-                           for g in self.param_groups
-                           for p in g["params"] if p.requires_grad)
+        # total #parameters (for α-β term)
+        self.d_total = sum(
+            p.numel()
+            for g in self.param_groups
+            for p in g["params"] if p.requires_grad)
 
         # RMS-shrink state
         self.global_step = 0
@@ -189,7 +163,9 @@ class DAG(Optimizer):
         self.rms_t_ema: Optional[float] = None
         self.s_t: float = 1.0
 
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------- #
+    # per-parameter state initialiser (unchanged)
+    # -------------------------------------------------------------- #
     def _ensure_state(self, p: torch.Tensor):
         st = self.state[p]
         if "alpha" not in st:
@@ -200,6 +176,30 @@ class DAG(Optimizer):
                 grp["momentum"] != 0 for grp in self.param_groups):
             st["momentum_buffer"] = None
 
+    # -------------------------------------------------------------- #
+    # k-value utilities
+    # -------------------------------------------------------------- #
+    def set_k_val(self, new_k: float):
+        """
+        Manually override the current vertical-stretch k.
+        This also freezes any schedule that was supplied at init time.
+        """
+        self.k_val  = float(new_k)
+        self.k_sched = None            # disable schedule            
+
+    @staticmethod
+    def cosine_decay(k0: float, total_steps: int):
+        """
+        Convenience factory: cosine decay from k0 → 0 over `total_steps`.
+        """
+        def _sched(step: int):
+            ratio = min(step, total_steps) / float(total_steps)
+            return k0 * 0.5 * (1.0 + math.cos(math.pi * ratio))
+        return _sched
+
+    # -------------------------------------------------------------- #
+    # internal helper (unchanged)
+    # -------------------------------------------------------------- #
     def _gather(self, group):
         params, grads, alphas, sats, sigmas, bufs = [], [], [], [], [], []
         for p in group["params"]:
@@ -215,31 +215,37 @@ class DAG(Optimizer):
             bufs.append(st.get("momentum_buffer"))
         return params, grads, alphas, sats, sigmas, bufs
 
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------- #
+    # optimisation step
+    # -------------------------------------------------------------- #
     @torch.no_grad()
     def step(self, closure=None):
         if closure is not None:
             with torch.enable_grad():
                 closure()
 
+        # ─── update k_val from schedule (if any) ─────────────── 
+        if self.k_sched is not None:
+            self.k_val = float(self.k_sched(self.global_step))
+
         h, scfg = self.h, self.s_cfg
         total_sq, total_n = 0.0, 0
 
+        # ----------------------------------------------------------
+        # main loop over parameter groups (everything below unchanged
+        # from the version you pasted)
+        # ----------------------------------------------------------
         for group in self.param_groups:
-            (
-                params, grads, alphas, sats, sigmas, bufs
-            ) = self._gather(group)
-
+            (params, grads, alphas,
+             sats, sigmas, bufs) = self._gather(group)
             if not params:
                 continue
 
-            # --- vectorised norms --------------------------------------------------
-            norms = torch._foreach_norm(grads, 2)  # list[0-d]
-
-            # --- σ update ----------------------------------------------------------
+            norms = torch._foreach_norm(grads, 2)        # ‖g‖
+            # ----- σ update -------------------------------------
             if self.use_exact_sigma and (self.global_step % self.sigma_every == 0):
                 exact = _try_multi_tensor_std(grads)
-                if exact is None:            # Apex missing: fall back to fast path
+                if exact is None:
                     if self.global_step == 0:
                         print("[DAG] Apex not found – using σ≈‖g‖/√d approximation.")
                     self.use_exact_sigma = False
@@ -248,12 +254,14 @@ class DAG(Optimizer):
 
             if not self.use_exact_sigma:
                 inv_sqrt_d = [1.0 / math.sqrt(p.numel()) for p in params]
-                torch._foreach_copy_(sigmas, torch._foreach_mul(norms, inv_sqrt_d))
+                torch._foreach_copy_(sigmas,
+                                     torch._foreach_mul(norms, inv_sqrt_d))
 
             sigma_cat = torch.stack(sigmas)
             norm_cat  = torch.stack(norms)
             dL        = torch.tensor([float(p.numel()) for p in params],
-                                     device=norm_cat.device, dtype=norm_cat.dtype)
+                                     device=norm_cat.device,
+                                     dtype=norm_cat.dtype)
             sat_prev  = torch.stack(sats)
 
             alpha_hat = (
@@ -263,62 +271,61 @@ class DAG(Optimizer):
                 * (h["p_star"] / (sat_prev + h["eps"])) ** h["eta"]
                 * self.s_t
             )
-
             alpha_new = (1 - h["rho"]) * torch.stack(alphas) + h["rho"] * alpha_hat
             alpha_new.clamp_(h["alpha_min"], h["alpha_max"])
             torch._foreach_copy_(alphas, list(alpha_new.unbind()))
 
-            # --- ĝ ---------------------------------------------------------------
-            inv_norm  = torch._foreach_reciprocal(torch._foreach_add(norms, h["eps"]))
-            g_norm    = torch._foreach_mul(grads, inv_norm)
+            # ----- normalise & scaled tanh -----------------------
+            inv_norm = torch._foreach_reciprocal(
+                torch._foreach_add(norms, h["eps"]))
+            g_norm   = torch._foreach_mul(grads, inv_norm)
 
-            # --- scaled tanh ------------------------------------------------------
             horiz = torch._foreach_div(list(alpha_new.unbind()), self.s_t)
             scaled_in = torch._foreach_mul(g_norm, horiz)
 
             if hasattr(torch, "_foreach_tanh"):
                 tanhd = torch._foreach_tanh(scaled_in)
-            else:  # fall back
+            else:
                 tanhd = [torch.tanh(t) for t in scaled_in]
 
             updates = torch._foreach_mul(tanhd, self.k_val * self.s_t)
 
-            # --- saturation ratio (only every sat_every steps) --------------------
+            # ----- saturation ratio ------------------------------
             if self.global_step % self.sat_every == 0:
                 abs_axg = [t.abs() for t in scaled_in]
                 new_sat = [a.gt(h["tau"]).float().mean() for a in abs_axg]
                 torch._foreach_copy_(sats, new_sat)
 
-            # --- weight decay ------------------------------------------------------
+            # ----- weight-decay ----------------------------------
             if group["weight_decay"]:
                 updates = torch._foreach_add(
-                    updates, torch._foreach_mul(params, group["weight_decay"]))
+                    updates,
+                    torch._foreach_mul(params, group["weight_decay"]))
 
-            # --- momentum (vectorised) --------------------------------------------
+            # ----- momentum --------------------------------------
             m, dmp = group["momentum"], group["dampening"]
             if m != 0.0:
-                # initialise missing buffers
-                for i, b in enumerate(bufs):
+                for i,b in enumerate(bufs):
                     if b is None:
                         b = torch.zeros_like(params[i])
                         bufs[i] = b
                         self.state[params[i]]["momentum_buffer"] = b
-
                 torch._foreach_mul_(bufs, m)
                 torch._foreach_add_(bufs, updates, alpha=1 - dmp)
-                updates = torch._foreach_add(updates, bufs, alpha=m) if group["nesterov"] else bufs
+                updates = (torch._foreach_add(updates, bufs, alpha=m)
+                           if group["nesterov"] else bufs)
 
             if group["maximize"]:
                 torch._foreach_neg_(updates)
 
-            # --- parameter update & RMS stats -------------------------------------
+            # ----- parameter update & RMS stats ------------------
             torch._foreach_add_(params, updates, alpha=-group["lr"])
 
             sq = torch._foreach_mul(updates, updates)
             total_sq += sum(t.sum() for t in sq).item()
             total_n  += sum(p.numel() for p in params)
 
-        # --- global RMS shrink ----------------------------------------------------
+        # ---------- global RMS-shrink ----------------------------
         if total_n:
             rms_now = math.sqrt(total_sq / total_n)
             β = scfg["ema_beta"]
