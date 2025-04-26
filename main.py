@@ -8,7 +8,7 @@ from collections import defaultdict
 import torch, torch.nn as nn, torch.optim as optim
 import torch.backends.cudnn as cudnn
 import torchvision, torchvision.transforms as transforms
-import pandas as pd, matplotlib.pyplot as plt # type: ignore
+import pandas as pd, matplotlib.pyplot as plt
 
 # repo-local imports
 from models import *
@@ -101,7 +101,8 @@ for model_name, ctor in MODEL_CATALOG:
         opt_cfgs = {
             "SGD" : dict(cls=optim.SGD,  lr=args.lr,  momentum=0.9, weight_decay=5e-4),
             "Adam": dict(cls=optim.Adam, lr=1e-3,    weight_decay=5e-4),
-            "DAG" : dict(cls=DAG,        lr=7e-3,    momentum=0.9, k_val=1, weight_decay=5e-4),
+            "DAG" : dict(cls=DAG,        lr=1e-5,    momentum=0.9, k_val=1, weight_decay=5e-4, shrink=dict(s_min=0.05, lambda_rms=0.25),
+                         k_sched=DAG.cosine_decay(k0=2.5, total_steps=args.epochs)),
         }
 
         hist = defaultdict(lambda: defaultdict(list))   # hist[opt][metric] → list
@@ -115,18 +116,40 @@ for model_name, ctor in MODEL_CATALOG:
                                 if hasattr(m,"reset_parameters") else None)
             opt   = cfg["cls"](net.parameters(), **{k:v for k,v in cfg.items() if k!='cls'})
             sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
+            
+            # cosine decay for k_val (optional)
+            def k_decay(ep, total, k0=1.5, k1=0.8):
+                return k1 + 0.5*(k0-k1)*(1+math.cos(math.pi*ep/total))
 
             for ep in range(args.epochs):
                 print(f"\nEpoch {ep:03d}")
-                tr_loss,tr_acc,step_sec = train_epoch(net,opt)
-                ts_loss,ts_acc          = test_epoch(net)
+
+                # (optional) cosine-decay k_val for DAG
+                if isinstance(opt, DAG):
+                    opt.set_k_val(k_decay(ep, args.epochs))
+
+                tr_loss, tr_acc, step_sec = train_epoch(net, opt)
+                ts_loss, ts_acc           = test_epoch (net)
                 sched.step()
 
-                h = hist[opt_name]
-                h["train_loss"].append(tr_loss); h["test_loss"].append(ts_loss)
-                h["train_acc"].append(tr_acc);  h["test_acc"].append(ts_acc)
-                h["step_time"].append(step_sec)
-                h["gap"].append(ts_loss-tr_loss)     # generalisation gap
+                # --------------------------------------
+                #  write to history  (grab h **first**!)
+                # --------------------------------------
+                h = hist[opt_name]          # ⇐ fetch dict once per epoch
+
+                h["train_loss"].append(tr_loss)
+                h["test_loss"] .append(ts_loss)
+                h["train_acc"] .append(tr_acc)
+                h["test_acc"]  .append(ts_acc)
+                h["step_time"] .append(step_sec)
+                h["gap"]       .append(ts_loss - tr_loss)
+
+                # add saturation ratio (only DAG)
+                if isinstance(opt, DAG) and hasattr(opt, "_last_sat"):
+                    sat = float(torch.mean(torch.tensor(opt._last_sat)))
+                    h["sat_ratio"].append(sat)
+                else:
+                    h["sat_ratio"].append(float("nan"))
 
                 print(f"[{opt_name}] ep{ep:03d} "
                       f"tr_acc={tr_acc:5.1f}% ts_acc={ts_acc:5.1f}% "
@@ -146,12 +169,13 @@ for model_name, ctor in MODEL_CATALOG:
                     plt.plot(x, metrics[test_key],
                              color=COLORS[opt], linestyle='--',
                              label=f"{opt}-test")
-            if logy: plt.yscale("log")
-            plt.title(f"{model_name} – {ylabel}")
-            plt.xlabel("epoch"); plt.ylabel(ylabel); plt.legend(fontsize=8)
-            plt.grid(True, alpha=.3)
-            plt.tight_layout()
-            plt.savefig(outdir/f"{kind}.png"); plt.close()
+            if logy: 
+                plt.yscale("log")
+                plt.title(f"{model_name} – {ylabel}")
+                plt.xlabel("epoch"); plt.ylabel(ylabel); plt.legend(fontsize=8)
+                plt.grid(True, alpha=.3)
+                plt.tight_layout()
+                plt.savefig(outdir/f"{kind}.png"); plt.close()
 
         plot_metric("loss", "Cross-entropy",
                     train_key="train_loss", test_key="test_loss", logy=False)
@@ -159,6 +183,8 @@ for model_name, ctor in MODEL_CATALOG:
                     train_key="train_acc",  test_key="test_acc")
         plot_metric("step_time", "sec / step",
                     train_key="step_time",  test_key=None)
+        plot_metric("sat_ratio","sat-ratio",
+                    train_key="sat_ratio", test_key=None)
 
     except Exception as e:
         print(f"[!]   {model_name} failed: {e}")
