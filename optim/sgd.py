@@ -118,8 +118,8 @@ class DAG(Optimizer):
     ):
         # ─── α-controller defaults ────────────────────────────────
         h = dict(
-            tau=2.5, p_star=0.10, kappa=None,
-            beta=1/3, eta=0.5, rho=0.05,
+            tau=1.25, p_star=0.10, kappa=None,
+            beta=1/3, eta=0.3, rho=0.1,
             eps=1e-8, alpha_min=1e-12, alpha_max=1e12,
         )
         if hyper: h.update(hyper)
